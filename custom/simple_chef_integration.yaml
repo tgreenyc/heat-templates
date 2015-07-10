@@ -1,0 +1,159 @@
+heat_template_version: 2013-05-23
+
+description: |
+  Deploy and boostrap a single node on Hosted Chef
+
+parameters:
+
+  external_network_id:
+    type: string
+    label: External Network
+    description: UUID of a Neutron external network
+    default: 15afc2c4-cfbf-4ead-ad0e-498909f3f71b
+
+  ubuntu_image:
+    type: string
+    label: Base OS Image
+    description: Name of image to use for servers
+    default: ubuntu-14.04-server-amd64
+
+  dns_server:
+    type: string
+    label: DNS Server
+    description: Comma separated list of DNS servers
+    default: "10.20.20.1"
+    constraints:
+      - allowed_pattern: "[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}"
+        description: Enter a valid IP address
+
+  host_size:
+     type: string
+     label: Host Flavor
+     description: Enter one available flavor type here
+     default: m1.small
+     constraints:
+       - allowed_values:
+         - m1.small
+         - m1.medium
+         - m1.large 
+
+resources:
+  # Create single network for all Cassandra nodes.
+  sample_net:
+    type: OS::Neutron::Net
+    properties:
+      admin_state_up: true
+      name: sample-network
+  sample_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      name: sample-subnet
+      cidr: 172.16.10.0/24
+      dns_nameservers: [ { get_param: dns_server } ]
+      enable_dhcp: true
+      gateway_ip: 172.16.10.1
+      network_id: { get_resource: sample_net }
+
+  # Chef bootstrap needs internet access, so create gateway.
+  sample_router:
+    type: OS::Neutron::Router
+    properties:
+      admin_state_up: true
+      name: sample-router
+  cassandra_router_gw:
+    type: OS::Neutron::RouterGateway
+    properties:
+      network_id: { get_param: external_network_id }
+      router_id: { get_resource: sample_router }
+  router_int0:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: { get_resource: sample_router }
+      subnet_id: { get_resource: sample_subnet }
+
+  # Enable SSH to the hosts.
+  host_secgrp:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: Allow SSH access to hosts.
+      name: host-secgrp
+      rules:
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+
+  # Need to get seed server IP early, so explicitly create port.
+  instance_port:
+    type: OS::Neutron::Port
+    properties:
+      admin_state_up: true
+      network_id: { get_resource: sample_net }
+      security_groups:
+        - { get_resource: host_secgrp }
+  instance_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: external_network_id }
+      port_id: { get_resource: instance_port }
+
+  # Create ports for other nodes, in case they need to be slaves.
+  host1_port:
+    type: OS::Neutron::Port
+    properties:
+      admin_state_up: true
+      network_id: { get_resource: sample_net }
+      security_groups:
+        - { get_resource: host_secgrp }
+  host2_port:
+    type: OS::Neutron::Port
+    properties:
+      admin_state_up: true
+      network_id: { get_resource: sample_net }
+      security_groups:
+        - { get_resource: host_secgrp }
+
+  # Provision instances.
+  sample_instance:
+    type: OS::Nova::Server
+    properties:
+      name: sample-instance
+      image: { get_param: ubuntu_image }
+      flavor: { get_param: host_size } 
+      networks:
+        - port: { get_resource: instance_port } 
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          params:
+            __instance_ipaddr__: { get_attr: [instance_port, fixed_ips, 0, ip_address] }
+          template: |
+            #cloud-config
+            chef:
+              # The following information is used to construct /etc/chef/client.rb
+              install_type: "omnibus"
+              omnibus_url: "https://www.chef.io/chef/install.sh"
+              force_install: false
+              server_url: "https://api.opscode.com/organizations/username"
+              log_location: "/var/log/chef-client.log"
+              # Use the next two parameters to create /etc/chef/validator.pem
+              validation_name: "username-validator"
+              # Populate your own validator.pem contents below
+              validation_key: |
+                -----BEGIN RSA PRIVATE KEY-----
+                -----END RSA PRIVATE KEY-----
+              run_list:
+                - "recipe[starter]"
+              # Sample injection of HOT attributes into the Chef node (constructs /etc/chef/firstboot.json)
+              initial_attributes:
+                cassandra:
+                  seeds:
+                    - __instance_ipaddr__
+            # Run the client after it has been installed and configured
+            runcmd:
+              - [ /usr/bin/chef-client ]
+
+outputs:
+  seed_public_ip:
+    description: Floating IP address of seed server
+    value: { get_attr: [ instance_floating_ip, floating_ip_address ] }
