@@ -1,0 +1,214 @@
+heat_template_version: 2013-05-23
+
+description: |
+  Create multi-node Jenkins cluster using Chef.
+
+parameters:
+
+  external_network_id:
+    type: string
+    label: External Network
+    description: UUID of a Neutron external network
+    default: 15afc2c4-cfbf-4ead-ad0e-498909f3f71b
+
+  ubuntu_image:
+    type: string
+    label: Base OS Image
+    description: Name of image to use for servers
+    default: ubuntu-14.04
+
+  dns_server:
+    type: string
+    label: DNS Server
+    description: Comma separated list of DNS servers
+    default: "10.20.20.1"
+    constraints:
+      - allowed_pattern: "[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}"
+        description: Enter a valid IP address
+
+  host_size:
+     type: string
+     label: Host Flavor
+     description: Enter one available flavor type here
+     default: m1.small
+     constraints:
+       - allowed_values:
+         - m1.small
+         - m1.medium
+         - m1.large 
+
+  num_slaves:
+     type: number
+     label: Jenkins Slaves
+     description: Number of Jenkins Slaves to deploy
+     default: "1"
+     constraints:
+       - range: { min: 1, max: 3 }
+
+resources:
+
+  jenkins_net:
+    type: OS::Neutron::Net
+    properties:
+      admin_state_up: true
+      name: jenkins-network
+  jenkins_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      name: jenkins-subnet
+      cidr: 172.16.10.0/24
+      dns_nameservers: [ { get_param: dns_server } ]
+      enable_dhcp: true
+      gateway_ip: 172.16.10.1
+      network_id: { get_resource: jenkins_net }
+
+  # Chef bootstrap needs internet access, so create gateway.
+  jenkins_router:
+    type: OS::Neutron::Router
+    properties:
+      admin_state_up: true
+      name: jenkins-router
+  jenkins_router_gw:
+    type: OS::Neutron::RouterGateway
+    properties:
+      network_id: { get_param: external_network_id }
+      router_id: { get_resource: jenkins_router }
+  router_int0:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: { get_resource: jenkins_router }
+      subnet_id: { get_resource: jenkins_subnet }
+
+  # [TODO]: lock down to correct Jenkins ports.
+  host_secgrp:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: Allow access to Jenkins
+      name: host-secgrp
+      rules:
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: tcp
+          direction: ingress
+          port_range_min: 1
+          port_range_max: 65535
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: tcp
+          direction: egress
+          port_range_min: 1
+          port_range_max: 65535
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: udp
+          direction: ingress
+          port_range_min: 1
+          port_range_max: 65535
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: udp
+          direction: egress
+          port_range_min: 1
+          port_range_max: 65535
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: icmp
+          direction: ingress
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: icmp
+          direction: egress
+
+  # Need to get master server IP early, so explicitly create port.
+  master_port:
+    type: OS::Neutron::Port
+    properties:
+      admin_state_up: true
+      network_id: { get_resource: jenkins_net }
+      security_groups:
+        - { get_resource: host_secgrp }
+  master_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: external_network_id }
+      port_id: { get_resource: master_port }
+
+  # Provision instances.
+  jenkins_master_host:
+    type: OS::Nova::Server
+    properties:
+      name: jenkins-master
+      key_name: putty
+      image: { get_param: ubuntu_image }
+      flavor: { get_param: host_size } 
+      networks:
+        - port: { get_resource: master_port } 
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          params:
+            __master_ipaddr__: { get_attr: [master_port, fixed_ips, 0, ip_address] }
+          template: |
+            #cloud-config
+            chef:
+              install_type: "omnibus"
+              omnibus_url: "https://www.chef.io/chef/install.sh"
+              force_install: false
+              server_url: "https://api.opscode.com/organizations/username"
+              log_location: "/var/log/chef-client.log"
+              validation_name: "username-validator"
+              validation_key: |
+                -----BEGIN RSA PRIVATE KEY-----
+                -----END RSA PRIVATE KEY-----
+              run_list:
+                - "recipe[jenkins::master]"
+              initial_attributes:
+                java:
+                  jdk_version: "7"
+            runcmd:
+              - [ /usr/bin/chef-client ]
+
+  jenkins_slaves:
+    type: OS::Heat::ResourceGroup
+    properties:
+      count: { get_param: num_slaves }
+      resource_def:
+        type: OS::Nova::Server
+        properties:
+          # index variable seems to be broken in Icehouse.
+          #name: jenkins-slave_%index%
+          key_name: putty
+          image: { get_param: ubuntu_image }
+          flavor: { get_param: host_size } 
+          networks:
+            - network: { get_resource: jenkins_net }
+          security_groups:
+            - { get_resource: host_secgrp }
+          user_data_format: RAW
+          user_data:
+            str_replace:
+              params:
+                __master_ipaddr__: { get_attr: [master_port, fixed_ips, 0, ip_address] }
+              template: |
+                #cloud-config
+                chef:
+                  install_type: "omnibus"
+                  omnibus_url: "https://www.chef.io/chef/install.sh"
+                  force_install: false
+                  server_url: "https://api.opscode.com/organizations/username"
+                  log_location: "/var/log/chef-client.log"
+                  validation_name: "username-validator"
+                  validation_key: |
+                    -----BEGIN RSA PRIVATE KEY-----
+                    -----END RSA PRIVATE KEY-----
+                  run_list:
+                    - "recipe[vio_training::slave]"
+                  initial_attributes:
+                    java:
+                      jdk_version: "7"
+                    jenkins:
+                      master:
+                        host: __master_ipaddr__
+                      executor:
+                        timeout: 600
+                runcmd:
+                  - [ /usr/bin/chef-client ]
+
+outputs:
+  seed_public_ip:
+    description: Floating IP address of master server
+    value: { get_attr: [ master_floating_ip, floating_ip_address ] }

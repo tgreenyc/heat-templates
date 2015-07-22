@@ -5,3 +5,4 @@
 cfn/cloudformation-examples/
 private
 .testrepository
+custom/jenkins_cluster_demo.yaml
