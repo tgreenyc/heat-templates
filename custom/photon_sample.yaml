@@ -1,0 +1,60 @@
+heat_template_version: 2013-05-23
+
+description: |
+  Sample heat template to deploy container into Photon instance.
+
+parameters:
+
+  external_network_id:
+    type: string
+    label: ext-net
+    description: UUID of a Neutron external network
+    default: 7092826e-d36b-46af-953b-fe587444a6c8
+
+  photon_image:
+    type: string
+    description: Name of image to use for servers
+    default: photon-tp2
+
+  photon_net:
+    type: string
+    description: Photon network
+    default: photon-net
+
+  container_name:
+    type: string
+    description: Name of Docker Hub container to use
+    default: vmwarecna/nginx
+
+resources:  
+  # Provision instance
+  photon_test:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: photon_image }
+      flavor: m1.small
+      networks:
+        - network: { get_param: photon_net }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          params:
+            __container__: { get_param: container_name }
+          template: |
+            #!/bin/bash
+            set -ux
+ 
+            docker pull __container__
+            docker run -d -p 80:80 __container__
+
+  # Attach floating IP
+  floater:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: external_network_id }
+      port_id: { get_attr: [ photon_test, addresses, { get_param: photon_net }, 0, port ] }
+
+outputs:
+  photon_public_ip:
+    description: Floating IP address of photon instance in public network
+    value: { get_attr: [ floater, floating_ip_address ] }
