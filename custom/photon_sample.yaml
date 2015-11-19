@@ -32,7 +32,7 @@ resources:
     type: OS::Nova::Server
     properties:
       image: { get_param: photon_image }
-      flavor: m1.small
+      flavor: m1.medium
       networks:
         - network: { get_param: photon_net }
       user_data_format: RAW
